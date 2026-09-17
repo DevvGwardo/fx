@@ -95,6 +95,12 @@ pub const NetworkFailureCause = enum {
     /// The stream produced no bytes past the stall threshold. Positive
     /// evidence that this exchange is dead; restarting it is the recovery.
     stream_stalled,
+    /// The provider delivered a stream that violates the wire contract and could
+    /// not be parsed (malformed chunk, unusable finish reason, tool arguments
+    /// that are not a JSON object). The transport itself was healthy, so this is
+    /// transient provider behavior rather than a local error, and replaying the
+    /// identical request is the correct recovery.
+    provider_stream_malformed,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.

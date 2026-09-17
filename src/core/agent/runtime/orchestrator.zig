@@ -3768,6 +3768,9 @@ fn checkpointCause(
         .authentication => .authentication,
         .request_limit_reached => .request_limit_reached,
         .content_filter => .provider_unavailable,
+        // A malformed provider stream resumes as an interrupted stream, which
+        // already means "replay the request" on the recovery path.
+        .provider_stream_malformed => .response_interrupted,
     };
 }
 
@@ -4671,6 +4674,7 @@ fn auto_retry_status(
             .authentication => .authentication,
             .request_limit_reached => .request_limit_reached,
             .content_filter => null,
+            .provider_stream_malformed => .response_interrupted,
         },
         .action = switch (strategy) {
             .retry_request => .retrying_request,
@@ -7626,6 +7630,7 @@ fn processQueuedPromptLoop(
                         .system_resumed => .system_resumed,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
+                        .provider_stream_malformed => .provider_stream_malformed,
                     }
                 else
                     recovery_cause;

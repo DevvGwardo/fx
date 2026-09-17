@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -607,7 +608,24 @@ pub const Reducer = struct {
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
         const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
         if (self.phase == .finished) {
-            const reason = try string(non_null(choice, "finish_reason") orelse return error.InconsistentFinishReason);
+            const trailing_finish = non_null(choice, "finish_reason");
+            if (trailing_finish == null) {
+                // A choice-bearing frame that arrives after the terminal frame
+                // without a finish_reason of its own is a late delta, not a
+                // contradiction: this endpoint emits the assistant's trailing
+                // text after it has already declared finish_reason. The response
+                // is otherwise complete, so keep the text and the turn rather
+                // than discarding a finished answer.
+                const trailing_reasoning = try self.accept_reasoning(delta);
+                const trailing_start = self.content.items.len;
+                if (non_null(delta, "content")) |value| try append_bounded(self.alloc, &self.content, try string(value), self.limits.content_bytes, error.ContentTooLarge);
+                if (non_null(root, "usage")) |usage| try self.accept_usage(usage, false);
+                return .{
+                    .content = if (self.content.items.len > trailing_start) self.content.items[trailing_start..] else null,
+                    .reasoning = trailing_reasoning,
+                };
+            }
+            const reason = try string(trailing_finish.?);
             if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
             var fields = delta.iterator();
             while (fields.next()) |field| {
@@ -790,7 +808,14 @@ pub const Reducer = struct {
             const sum = std.math.add(u64, usage.input_tokens orelse 0, usage.output_tokens orelse 0) catch return error.InvalidChunk;
             const exact = (incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output);
             if (incoming_total != null or final_fields.total) {
-                if (tokens < sum or (exact and tokens != sum)) return error.InvalidChunk;
+                // A reported total may include cache, template, and reasoning
+                // tokens that prompt_tokens and completion_tokens do not itemize
+                // (Surplus and DeepSeek report totals above the itemized sum), so
+                // an exact sum is not required here; only an impossible total is a
+                // contradiction. The carried/progress else-branch below still
+                // guards against a later sum that overtakes an observed total.
+                if (tokens < sum) return error.InvalidChunk;
+                if (exact and tokens != sum) debug_trace.logf("gateway", "provider total {d} differs from itemized sum {d}; accepting (unitemized cache/template/reasoning)", .{ tokens, sum });
             } else if (exact and sum < tokens) return error.InvalidChunk;
         }
         for (
@@ -1579,14 +1604,34 @@ test "chat completions progress totals constrain current assertions rather than 
     try std.testing.expectEqual(@as(?u64, 2), result.completed.completion.usage.output_tokens);
 }
 
+test "chat completions accepts provider totals above itemized counts" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    // Surplus and DeepSeek report a total that includes template, cache, and
+    // reasoning tokens their prompt_tokens and completion_tokens do not
+    // itemize, so a total above the itemized sum is not a contradiction.
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":2,\"total_tokens\":87}}");
+    try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":2,\"total_tokens\":87}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings("hello", completion.content.?);
+    try std.testing.expectEqual(@as(?u64, 26), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 87), reducer.usage_total);
+}
+
 test "chat completions partial usage rejects conflicts against merged observations" {
     const alloc = std.testing.allocator;
     for ([_]struct { first: []const u8, next: []const u8, final: bool = false, failure: Error }{
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":12}", .failure = error.InvalidChunk },
         .{ .first = "{\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":2}", .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":14}", .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":14}", .final = true, .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":2}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":12}", .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":12}", .final = true, .failure = error.InvalidChunk },
+        .{ .first = "{\"prompt_tokens\":12,\"total_tokens\":13}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"prompt_tokens\":9223372036854775807}", .next = "{\"completion_tokens\":9223372036854775807,\"total_tokens\":9223372036854775807}", .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.InvalidChunk },
@@ -1881,7 +1926,7 @@ test "chat completions repeated terminal choices reject invalid or conflicting u
     const cases = [_]struct { usage: []const u8, seed_usage: bool = false, expected: Error = error.InvalidChunk }{
         .{ .usage = "{\"prompt_tokens\":-1}" },
         .{ .usage = "{\"prompt_tokens\":1.5}" },
-        .{ .usage = "{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":3}" },
+        .{ .usage = "{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":1}" },
         .{ .usage = "{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}", .seed_usage = true, .expected = error.ConflictingIdentity },
     };
     for (cases) |case| {
@@ -1976,6 +2021,24 @@ test "chat completions terminal evidence and finish reasons are strict" {
     }
 }
 
+test "chat completions keeps a trailing delta that follows the terminal frame" {
+    const alloc = std.testing.allocator;
+    // This endpoint emits the assistant's trailing text after it has already
+    // declared finish_reason, in a frame that carries no finish_reason of its
+    // own. The answer is already complete, so the text is kept rather than
+    // failing the turn with InconsistentFinishReason.
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"found it\"},\"finish_reason\":null}]}");
+    try test_accept(&reducer, test_stop);
+    const trailing = try reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\" and\"}}]}", false);
+    try std.testing.expectEqualStrings(" and", trailing.content.?);
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("found it and", result.completed.completion.content.?);
+}
+
 test "chat completions rejects malformed chunks contradictory identities and extra choices" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { first: ?[]const u8 = null, chunk: []const u8, failure: Error }{
@@ -2027,7 +2090,7 @@ test "chat completions usage trailers preserve observations without billing" {
     for ([_][]const u8{
         "{\"choices\":[],\"usage\":{\"prompt_tokens\":-1}}",
         "{\"choices\":[],\"usage\":{\"completion_tokens\":1.5}}",
-        "{\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":8}}",
+        "{\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":4}}",
     }) |invalid| {
         var bad = try Reducer.init(alloc, test_request(), .{});
         defer bad.deinit();
@@ -2253,7 +2316,7 @@ test "chat completions repeated consistent identity preserves one call and selec
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
 }
 
-test "chat completions usage conflicts late errors and post terminal data cannot succeed" {
+test "chat completions usage conflicts late errors and post terminal closing cannot succeed" {
     const alloc = std.testing.allocator;
     {
         var reducer = try Reducer.init(alloc, test_request(), .{});
@@ -2272,7 +2335,14 @@ test "chat completions usage conflicts late errors and post terminal data cannot
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
-        try std.testing.expectError(error.InconsistentFinishReason, reducer.accept(test_text, false));
+        const trailing = try reducer.accept(test_text, false);
+        // A frame without a finish_reason that arrives after the terminal frame
+        // carries a late delta. The reducer keeps it and returns the new content.
+        try std.testing.expectEqualStrings("hello", trailing.content.?);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
     }
     {
         var reducer = try Reducer.init(alloc, test_request(), .{});
