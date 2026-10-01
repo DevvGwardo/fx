@@ -410,6 +410,15 @@ pub const ModelFailureDiagnostic = struct {
             .{ "HostUnreachable", "host unreachable" },
             .{ "NetworkInterrupted", "network interrupted" },
             .{ "StreamInterrupted", "stream interrupted" },
+            // Provider wire-contract violations raised by the stream reducer;
+            // raw Zig error names are meaningless in a status line.
+            .{ "ConflictingIdentity", "inconsistent stream data" },
+            .{ "InvalidChunk", "malformed stream chunk" },
+            .{ "IncompleteStream", "stream ended without a finish signal" },
+            .{ "InvalidFinishReason", "invalid finish signal" },
+            .{ "InconsistentFinishReason", "inconsistent finish signal" },
+            .{ "InvalidToolCallId", "missing tool call id" },
+            .{ "InvalidToolArguments", "invalid tool arguments" },
         };
         inline for (pairs) |pair| {
             if (std.mem.eql(u8, raw, pair[0])) return pair[1];
@@ -780,6 +789,10 @@ test "model failure diagnostic translates known transport names only" {
     try std.testing.expectEqualStrings(
         "HTTP 503 · no_available_providers: No providers are currently available",
         ModelFailureDiagnostic.init("HTTP 503 · no_available_providers: No providers are currently available").humanText(),
+    );
+    try std.testing.expectEqualStrings(
+        "inconsistent stream data",
+        ModelFailureDiagnostic.init("ConflictingIdentity").humanText(),
     );
 }
 

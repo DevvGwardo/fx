@@ -166,6 +166,16 @@ pub noinline fn decide(evidence: Evidence) Decision {
                 .required_action = .inspect_uncertain_tool,
             };
         }
+        // The same wire-contract violation at the same progress point is a
+        // deterministic provider fault: replaying the identical request
+        // reproduces the same broken stream, so stop instead of burning the
+        // full replay budget on identical failures.
+        if (evidence.progress == .stalled) {
+            return .{
+                .strategy = .stop,
+                .required_action = .surface_stall,
+            };
+        }
         if (evidence.attempts.consumed >= evidence.attempts.limit) {
             return .{
                 .strategy = .pause,
@@ -341,6 +351,15 @@ test "malformed provider streams replay the request instead of continuing" {
     const paused = decide(exhausted);
     try std.testing.expectEqual(Strategy.pause, paused.strategy);
     try std.testing.expect(!paused.reserve_provider_attempt);
+
+    // The same violation at the same progress point is a deterministic
+    // provider fault: stop instead of replaying the identical request forever.
+    var stalled = base;
+    stalled.progress = .stalled;
+    const stopped = decide(stalled);
+    try std.testing.expectEqual(Strategy.stop, stopped.strategy);
+    try std.testing.expectEqual(RequiredAction.surface_stall, stopped.required_action);
+    try std.testing.expect(!stopped.reserve_provider_attempt);
 
     // Cancellation always wins.
     var cancelled = base;
